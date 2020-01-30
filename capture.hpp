@@ -1017,7 +1017,8 @@ int DesktopCapture(DESKTOPCAPTUREPARAMS& dp)
         }
     };
 
-    
+    EnumVistaMixers();
+
 
 
 /*    if (dp.HasAudio)
@@ -1076,8 +1077,11 @@ int DesktopCapture(DESKTOPCAPTUREPARAMS& dp)
     rt = a;
 
     if (dp.hWnd)
+    {
         GetWindowRect(dp.hWnd, &dp.rx);
-
+        if (dp.rx.left < 0 || dp.rx.right < 0)
+            dp.rx = {};
+    }
 
     CComPtr<IMMDeviceEnumerator> deviceEnumerator = 0;
     if(dp.HasAudio)
