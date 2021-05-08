@@ -790,8 +790,10 @@ public:
             return 0;
 
         // Get DXGI adapter
+        HRESULT hr = 0;
+
         CComPtr<IDXGIAdapter> lDxgiAdapter;
-        auto hr = lDxgiDevice->GetParent(
+        hr = lDxgiDevice->GetParent(
             __uuidof(IDXGIAdapter),
             reinterpret_cast<void**>(&lDxgiAdapter));
 
@@ -843,6 +845,7 @@ public:
         desc.MipLevels = 1;
         desc.CPUAccessFlags = 0;
         desc.Usage = D3D11_USAGE_DEFAULT;
+        lGDIImage = 0;
         hr = device->CreateTexture2D(&desc, NULL, &lGDIImage);
         if (FAILED(hr))
             return 0;
@@ -862,6 +865,7 @@ public:
         desc.MipLevels = 1;
         desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ | D3D11_CPU_ACCESS_WRITE;
         desc.Usage = D3D11_USAGE_STAGING;
+        lDestImage = 0;
         hr = device->CreateTexture2D(&desc, NULL, &lDestImage);
         if (FAILED(hr))
             return 0;
@@ -888,6 +892,10 @@ struct DESKTOPCAPTUREPARAMS
     GUID VIDEO_ENCODING_FORMAT = MFVideoFormat_H264;
     GUID AUDIO_ENCODING_FORMAT = MFAudioFormat_MP3;
     std::wstring f;
+    void* cb = 0;
+    std::function<HRESULT(const BYTE* d, size_t sz,void* cb)> Streamer;
+    std::function<HRESULT(const BYTE* d, size_t sz,void* cb)> Framer;
+    std::function<void(IMFAttributes* a)> PrepareAttributes;
     int fps = 25;
     int NumThreads = 0;
     int Qu = -1;
@@ -908,6 +916,245 @@ struct DESKTOPCAPTUREPARAMS
     bool MustEnd = false;
     bool Pause = false;
 };
+
+
+struct VectorStreamX2 : public IMFByteStream
+{
+    ULONG r = 1;
+    std::vector<char> d;
+    size_t p = 0;
+
+    // IUnknown
+    virtual HRESULT STDMETHODCALLTYPE QueryInterface(
+        /* [in] */ REFIID riid,
+        /* [iid_is][out] */ _COM_Outptr_ void __RPC_FAR* __RPC_FAR* ppvObject)
+    {
+        if (riid == __uuidof(IUnknown) || riid == __uuidof(IMFByteStream))
+        {
+            *ppvObject = (IStream*)this;
+            r++;
+            return S_OK;
+        }
+        return E_NOINTERFACE;
+    }
+
+    virtual ULONG STDMETHODCALLTYPE AddRef(void)
+    {
+        return ++r;
+    }
+
+    virtual ULONG STDMETHODCALLTYPE Release(void)
+    {
+        return --r;
+    }
+
+    HRESULT __stdcall  BeginRead(
+        BYTE* pb,
+        ULONG            cb,
+        IMFAsyncCallback* pCallback,
+        IUnknown* punkState
+    )
+    {
+        ULONG pcb = 0;
+        Read(pb, cb, &pcb);
+        NextCB = pcb;
+        CComPtr<IMFAsyncResult> ar;
+        MFCreateAsyncResult(0, pCallback, punkState, &ar);
+        pCallback->Invoke(ar);
+        return S_OK;
+    }
+
+    ULONG NextCB = 0;
+    HRESULT __stdcall   BeginWrite(
+        const BYTE* pb,
+        ULONG            cb,
+        IMFAsyncCallback* pCallback,
+        IUnknown* punkState
+    )
+    {
+        ULONG pcb = 0;
+        Write(pb, cb, &pcb);
+        NextCB = pcb;
+        CComPtr<IMFAsyncResult> ar;
+        MFCreateAsyncResult(0, pCallback, punkState, &ar);
+        pCallback->Invoke(ar);
+        return S_OK;
+    }
+
+    HRESULT __stdcall   Close(
+
+    )
+    {
+        return S_OK;
+    }
+
+    HRESULT __stdcall  EndRead(
+        IMFAsyncResult* pResult,
+        ULONG* pcbRead
+    )
+    {
+        if (!pcbRead)
+            return E_POINTER;
+        *pcbRead = NextCB;
+        return S_OK;
+    }
+
+    HRESULT __stdcall EndWrite(
+        IMFAsyncResult* pResult,
+        ULONG* pcbWritten
+    )
+    {
+        if (!pcbWritten)
+            return E_POINTER;
+        *pcbWritten = NextCB;
+        return S_OK;
+    }
+
+    HRESULT __stdcall  Flush()
+    {
+        return S_OK;
+    }
+
+    HRESULT __stdcall   GetCapabilities(
+        DWORD* pdwCapabilities
+    )
+    {
+        if (!pdwCapabilities)
+            return E_POINTER;
+        *pdwCapabilities = MFBYTESTREAM_IS_READABLE | MFBYTESTREAM_IS_WRITABLE | MFBYTESTREAM_IS_SEEKABLE;
+        return S_OK;
+    }
+
+    HRESULT __stdcall  GetCurrentPosition(
+        QWORD* pqwPosition
+    )
+    {
+        if (!pqwPosition)
+            return E_POINTER;
+        *pqwPosition = p;
+        return S_OK;
+    }
+
+    HRESULT __stdcall  GetLength(
+        QWORD* q
+    )
+    {
+        if (!q)
+            return E_POINTER;
+        *q = d.size();
+        return S_OK;
+    }
+
+    HRESULT __stdcall  IsEndOfStream(
+        BOOL* q
+    )
+    {
+        if (!q)
+            return E_POINTER;
+        *q = FALSE;
+        if (p == d.size())
+            *q = TRUE;
+        return S_OK;
+    }
+
+    HRESULT __stdcall  Read(
+        BYTE* pv,
+        ULONG cb,
+        ULONG* pcbRead
+    )
+    {
+        auto av = d.size() - p;
+        if (cb < av)
+            av = cb;
+        memcpy(pv, d.data() + p, av);
+        p += av;
+        if (pcbRead)
+            *pcbRead = (ULONG)av;
+        if (av < cb)
+            return S_FALSE;
+        return S_OK;
+    }
+
+    std::function<HRESULT(const BYTE*, size_t,void* cb)> func;
+    void* cbx = 0;
+    HRESULT __stdcall  Write(
+        const BYTE* pv,
+        ULONG      cb,
+        ULONG* pcbWritten
+    )
+    {
+        if (d.size() < (p + cb))
+        {
+            auto exc = (p + cb) - d.size();
+            d.resize(d.size() + exc);
+        }
+        memcpy(d.data() + p, pv, cb);
+
+        if (func)
+        {
+          auto hr = func(pv, cb,cbx);
+          if (FAILED(hr))
+              return hr;
+        }
+
+
+        p += cb;
+        if (pcbWritten)
+            *pcbWritten = cb;
+        return S_OK;
+    }
+
+    HRESULT __stdcall  SetLength(
+        QWORD qwLength
+    )
+
+    {
+        d.resize(qwLength);
+        if (p >= qwLength)
+            p = qwLength;
+        return S_OK;
+    }
+
+    HRESULT __stdcall  SetCurrentPosition(
+        QWORD q
+    )
+    {
+        if (q > d.size())
+            return E_FAIL;
+        p = q;
+        return S_OK;
+
+    }
+
+
+    HRESULT __stdcall Seek(
+        MFBYTESTREAM_SEEK_ORIGIN dwOrigin,
+        LONGLONG                 llSeekOffset,
+        DWORD                    dwSeekFlags,
+        QWORD* pqwCurrentPosition
+    )
+    {
+        LARGE_INTEGER lo = { 0 };
+        if (dwOrigin == msoBegin)
+        {
+            p = llSeekOffset;
+        }
+        if (dwOrigin == msoCurrent)
+        {
+            p += llSeekOffset;
+        }
+        if (p >= d.size())
+            p = d.size();
+        if (pqwCurrentPosition)
+            *pqwCurrentPosition = p;
+
+        return S_OK;
+    }
+
+
+};
+
+
 
 int DesktopCapture(DESKTOPCAPTUREPARAMS& dp)
 {
@@ -1087,7 +1334,6 @@ int DesktopCapture(DESKTOPCAPTUREPARAMS& dp)
     if(dp.HasAudio)
         hr = CoCreateInstance(__uuidof(MMDeviceEnumerator), NULL, CLSCTX_INPROC_SERVER, __uuidof(IMMDeviceEnumerator), (LPVOID*)&deviceEnumerator);
 
-
     CAPTURE cap;
     int wi = 0, he = 0;
     if (dp.HasVideo)
@@ -1109,15 +1355,35 @@ int DesktopCapture(DESKTOPCAPTUREPARAMS& dp)
     MFCreateAttributes(&attrs, 0);
     attrs->SetUINT32(MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS, true);
 
+    VectorStreamX2 bs;
+    bs.func = dp.Streamer;
     CComPtr<IMFSinkWriter> pSinkWriter;
-    hr = MFCreateSinkWriterFromURL(dp.f.c_str(), NULL, attrs, &pSinkWriter);
+    if (dp.f.empty())
+    {
+        if (dp.Framer)
+        {
+            hr = S_OK;
+        }
+        else
+        {
+            if (dp.HasVideo)
+                attrs->SetGUID(MF_TRANSCODE_CONTAINERTYPE, MFTranscodeContainerType_MPEG4);
+            else
+                attrs->SetGUID(MF_TRANSCODE_CONTAINERTYPE, MFTranscodeContainerType_MP3);
+            if (dp.PrepareAttributes)
+                dp.PrepareAttributes(attrs);
+            hr = MFCreateSinkWriterFromURL(NULL, &bs, attrs, &pSinkWriter);
+        }
+    }
+    else
+        hr = MFCreateSinkWriterFromURL(dp.f.c_str(), NULL, attrs, &pSinkWriter);
     if (FAILED(hr)) return -3;
 
 
     CComPtr<IMFMediaType> pMediaTypeOutVideo;
     DWORD OutVideoStreamIndex = 0;
     CComPtr<IMFMediaType> pMediaTypeVideoIn;
-    if (dp.HasVideo)
+    if (dp.HasVideo && !dp.Framer)
     {
         hr = MFCreateMediaType(&pMediaTypeOutVideo);
         if (FAILED(hr)) return -4;
@@ -1366,7 +1632,7 @@ int DesktopCapture(DESKTOPCAPTUREPARAMS& dp)
     if (!NV12)
         pMediaTypeVideoIn->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_RGB32);
 
-    if (dp.HasVideo)
+    if (dp.HasVideo && !dp.Framer)
     {
         hr = pSinkWriter->SetInputMediaType(OutVideoStreamIndex, pMediaTypeVideoIn, NULL);
         if (FAILED(hr)) return -10;
@@ -1435,7 +1701,8 @@ int DesktopCapture(DESKTOPCAPTUREPARAMS& dp)
     }
 
 
-    hr = pSinkWriter->BeginWriting();
+    if (pSinkWriter)
+        hr = pSinkWriter->BeginWriting();
     if (FAILED(hr)) return -13;
 
     const LONG cbWidth = 4 * wi;
@@ -1459,7 +1726,7 @@ int DesktopCapture(DESKTOPCAPTUREPARAMS& dp)
 #endif
     for (;;)
     {
-        if (!dp.HasAudio)
+        if (!dp.HasAudio && !dp.Framer)
             Sleep((DWORD)msloop);
         if (dp.MustEnd)
             break;
@@ -1652,6 +1919,7 @@ int DesktopCapture(DESKTOPCAPTUREPARAMS& dp)
 
         // Get new frame
         BYTE* pData = NULL;
+        HRESULT hrf = S_FALSE;
         if (dp.HasVideo)
         {
             hr = cap.lDeskDupl->AcquireNextFrame(
@@ -1660,6 +1928,23 @@ int DesktopCapture(DESKTOPCAPTUREPARAMS& dp)
                 &lDesktopResource);
             if (hr == DXGI_ERROR_WAIT_TIMEOUT)
                 hr = S_OK;
+            if (hr == DXGI_ERROR_ACCESS_LOST)
+            {
+                cap.lDeskDupl = 0;
+                bool C = false;
+                for (int i = 0; i < 10; i++)
+                {
+                    if (cap.Prepare(dp.nOutput))
+                    {
+                        C = true;
+                        break;
+                    }
+                    Sleep(250);
+                }
+                if (!C)
+                    break;
+                hr = S_OK;
+            }
             if (FAILED(hr))
                 break;
 
@@ -1676,7 +1961,9 @@ int DesktopCapture(DESKTOPCAPTUREPARAMS& dp)
             if (FAILED(hr))
                 break;
 
-            memcpy(pData, cap.buf.data(), VideoBufferSize);
+            memcpy(pData, cap.buf.data(), min(cap.buf.size(),VideoBufferSize));
+            if (dp.Framer)
+                hrf = dp.Framer(cap.buf.data(), min(cap.buf.size(),VideoBufferSize),dp.cb);
 
             hr = pVideoBuffer->Unlock();
             if (FAILED(hr)) break;
@@ -1716,7 +2003,7 @@ int DesktopCapture(DESKTOPCAPTUREPARAMS& dp)
                     pVideoSample = s2;
             }
 
-            if (pVideoSample && dp.HasVideo)
+            if (pVideoSample && dp.HasVideo && !dp.Framer)
             {
                 hr = pVideoSample->SetSampleTime(rtV);
                 if (FAILED(hr)) break;
@@ -1797,6 +2084,9 @@ int DesktopCapture(DESKTOPCAPTUREPARAMS& dp)
         auto rvx = rtV / 10000;
         if (dp.EndMS > 0 && rvx >= dp.EndMS)
             break;
+
+        if (dp.Framer && hrf == S_OK)
+            break;
     }
 
     // Audio off
@@ -1806,7 +2096,10 @@ int DesktopCapture(DESKTOPCAPTUREPARAMS& dp)
             a6->ac->Stop();
     }
 
-    hr = pSinkWriter->Finalize();
+    if (pSinkWriter)
+        hr = pSinkWriter->Finalize();
+    if (FAILED(hr))
+        return -14;
 	return 0;
 }
 
